@@ -1,0 +1,38 @@
+name: build-aix
+on:
+  push:
+    paths: ["src/**", ".github/workflows/**"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sumber extension
+        uses: actions/checkout@v4
+        with:
+          path: ours
+
+      - name: Java 8 (sesuai extension-template)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
+
+      - name: Install ant + git
+        run: sudo apt-get update && sudo apt-get install -y ant git
+
+      - name: Clone extension-template (+submodule deps)
+        run: git clone --recurse-submodules https://github.com/mit-cml/extension-template.git template
+
+      - name: Salin sumber ke template
+        run: cp -r ours/src/* template/src/
+
+      - name: Build .aix
+        run: cd template && ant extensions
+
+      - name: Upload artefak .aix
+        uses: actions/upload-artifact@v4
+        with:
+          name: Tools_Chatbot-aix
+          path: template/out/*.aix
