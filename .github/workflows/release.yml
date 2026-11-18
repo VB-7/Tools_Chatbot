@@ -1,0 +1,18 @@
+name: release-aix
+on:
+  push:
+    paths: ["Tools_Chatbot.aix", ".github/workflows/release.yml"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Upload .aix ke rilis v1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view v1 --repo "$GITHUB_REPOSITORY" || gh release create v1 --repo "$GITHUB_REPOSITORY" --title "Tools_Chatbot v1" --notes "Extension MIT App Inventor (AiTeks + AiImage). Cara pasang ada di README."
+          gh release upload v1 Tools_Chatbot.aix --repo "$GITHUB_REPOSITORY" --clobber
