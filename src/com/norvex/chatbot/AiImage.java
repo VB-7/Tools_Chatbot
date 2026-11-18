@@ -10,8 +10,8 @@ import com.google.appinventor.components.runtime.AndroidNonvisibleComponent;
 import com.google.appinventor.components.runtime.ComponentContainer;
 
 @DesignerComponent(
-    version = 1,
-    versionName = "1.0",
+    version = 2,
+    versionName = "1.1",
     description = "AI image (stateless, tanpa history/cache/storage lokal). "
         + "Wajib AiTeks.CallCreateChatbot dulu + tunggu ready. "
         + "base64=true -> E3 bawa base64 RAM-only; false -> upload -> E3 bawa url.",
@@ -43,9 +43,10 @@ public class AiImage extends AndroidNonvisibleComponent {
   @SimpleFunction(description = "CALL: prompt + n_prompt (negative, kosong=tidak ada) + seed "
       + "(-1/<0 = acak) + resolution (square/portrait/landscape/square_hd atau "
       + "512x512/512x768/768x512/768x768) + guidance (1-30, default 7) + base64 flag.")
-  public void CallGenerateImage(String prompt, String nPrompt, double seed, String resolution,
+  public void CallGenerateImage(String prompt, String nPrompt, double seed, Resolution resolution,
       double guidance, boolean base64) {
-    engine.callGenerateImage(prompt, nPrompt, seed, resolution, guidance, base64);
+    engine.callGenerateImage(prompt, nPrompt, seed,
+        resolution == null ? "square" : resolution.toUnderlyingValue(), guidance, base64);
   }
 
   @SimpleFunction(description = "CALL: batalkan generate image yang berjalan. Sukses -> error 4.")
