@@ -22,3 +22,10 @@ Lokal: `git clone --recurse-submodules`, salin `src/` ke
 `mit-cml/extension-template`, `ant extensions` (butuh Java 8 + ant).
 
 Spek blok lengkap: lihat `TOOLS_CHATBOT.md` di generator NorVex-Beta.
+
+## Unduh .aix
+
+- Download langsung (raw): https://raw.githubusercontent.com/VB-7/Tools_Chatbot/main/Tools_Chatbot.aix
+- Halaman rilis: https://github.com/VB-7/Tools_Chatbot/releases/tag/v1
+
+Cara pasang: MIT App Inventor → Palette → Extension → Import extension → pilih file .aix.
