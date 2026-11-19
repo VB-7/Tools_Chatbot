@@ -1,6 +1,7 @@
 package com.norvex.chatbot;
 
 import com.google.appinventor.components.annotations.DesignerComponent;
+import com.google.appinventor.components.annotations.Options;
 import com.google.appinventor.components.annotations.SimpleEvent;
 import com.google.appinventor.components.annotations.SimpleFunction;
 import com.google.appinventor.components.annotations.SimpleObject;
@@ -13,7 +14,8 @@ import com.google.appinventor.components.runtime.ComponentContainer;
     version = 2,
     versionName = "1.1",
     description = "AI image (stateless, tanpa history/cache/storage lokal). "
-        + "Wajib AiTeks.CallCreateChatbot dulu + tunggu ready. "
+        + "Panggil CallCreateChatbot dulu (milik komponen ini sendiri, mesin sama dengan AiTeks) "
+        + "lalu tunggu WhenChatbotCreate ready=true. Bisa dipakai TANPA AiTeks. "
         + "base64=true -> E3 bawa base64 RAM-only; false -> upload -> E3 bawa url.",
     category = ComponentCategory.EXTENSION,
     nonVisible = true,
@@ -30,6 +32,33 @@ public class AiImage extends AndroidNonvisibleComponent {
     engine.attachImage(this);
   }
 
+  // ---------------- E0 / C0 / C0b / I0 (mandiri, mesin sama dengan AiTeks) ----------------
+
+  @SimpleEvent(description = "Hasil CallCreateChatbot. success = WebView+halaman termuat; "
+      + "ready = sinyal backend. Siap penuh = keduanya true. "
+      + "Cukup panggil Create sekali dari AiTeks ATAU AiImage (mesin sama).")
+  public void WhenChatbotCreate(boolean success, boolean ready, int errorCode, String message) {
+  }
+
+  @SimpleFunction(description = "CALL: bangun WebView tersembunyi + muat halaman backend SEKALI. "
+      + "Tanpa input apa pun. Panggil sekali di awal (mis. Screen Initialize). "
+      + "Cukup dari salah satu komponen saja.")
+  public void CallCreateChatbot() {
+    engine.callCreate();
+  }
+
+  @SimpleFunction(description = "CALL: buang WebView + bersihkan sesi.")
+  public void RemoveChatbot() {
+    engine.callRemove();
+  }
+
+  @SimpleFunction(description = "IS: true bila backend sudah ready (siap terima generate).")
+  public boolean IsChatbotReady() {
+    return engine.isReady();
+  }
+
+  // ---------------- E3 / E4 / C4 / C5 / I2 ----------------
+
   @SimpleEvent(description = "Hasil gambar. isfinished=true sekali. base64 terisi bila "
       + "Call pakai base64=true (RAM-only); url terisi bila base64=false (via upload).")
   public void WhenAIGenerateImage(boolean isfinished, String base64, String url) {
@@ -41,12 +70,11 @@ public class AiImage extends AndroidNonvisibleComponent {
   }
 
   @SimpleFunction(description = "CALL: prompt + n_prompt (negative, kosong=tidak ada) + seed "
-      + "(-1/<0 = acak) + resolution (square/portrait/landscape/square_hd atau "
-      + "512x512/512x768/768x512/768x768) + guidance (1-30, default 7) + base64 flag.")
-  public void CallGenerateImage(String prompt, String nPrompt, double seed, Resolution resolution,
-      double guidance, boolean base64) {
-    engine.callGenerateImage(prompt, nPrompt, seed,
-        resolution == null ? "square" : resolution.toUnderlyingValue(), guidance, base64);
+      + "(-1/<0 = acak) + resolution [dropdown: Square/Portrait/Landscape/SquareHd] "
+      + "+ guidance (1-30, default 7) + base64 flag.")
+  public void CallGenerateImage(String prompt, String nPrompt, double seed,
+      @Options(Resolution.class) String resolution, double guidance, boolean base64) {
+    engine.callGenerateImage(prompt, nPrompt, seed, resolution, guidance, base64);
   }
 
   @SimpleFunction(description = "CALL: batalkan generate image yang berjalan. Sukses -> error 4.")
