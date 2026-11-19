@@ -81,6 +81,19 @@ public class ChatbotEngine {
   private String systemPrompt = "";
   private boolean autoHistory = true;
 
+  // ---------------- batch image (C6): antre prompt, generate satu per satu ----------------
+  static final int IMAGE_BATCH_CAP = 20;
+  private boolean batchActive = false;
+  private final ArrayList<String> batchPrompts = new ArrayList<String>();
+  private int batchIndex = 0;
+  private int batchOk = 0;
+  private int batchFail = 0;
+  private String batchNPrompt = "";
+  private int batchSeed = -1;
+  private String batchResolution = "512x512";
+  private int batchGuidance = 7;
+  private boolean batchBase64 = true;
+
   private static final class Turn {
     final String role;
     String text;
@@ -199,6 +212,11 @@ public class ChatbotEngine {
       pageOk = false;
       mirror.clear();
       clearPending = false;
+      batchActive = false;
+      batchPrompts.clear();
+      batchIndex = 0;
+      batchOk = 0;
+      batchFail = 0;
       textAccum.setLength(0);
       imgParts = null;
       imgReceived = 0;
@@ -330,33 +348,216 @@ public class ChatbotEngine {
         dispatchImageError(5, "resolusi salah");
         return;
       }
-      busy = true;
-      activeKind = "image";
-      activeId = newId();
-      chunkMode = false;
-      pendingPrompt = p;
-      pendingImage = "";
-      imgParts = null;
-      imgReceived = 0;
-      imgMime = "";
-      armTimeout(genTag, IMAGE_TIMEOUT_MS + 5000, true);
-      try {
-        JSONObject o = new JSONObject();
-        o.put("kind", "image");
-        o.put("id", activeId);
-        o.put("prompt", p);
-        o.put("n_prompt", np);
-        o.put("seed", fSeed);
-        o.put("resolution", res);
-        o.put("guidance", fGuidance);
-        o.put("base64", fBase64);
-        o.put("systemPrompt", systemPrompt);
-        eval(o.toString());
-      } catch (Exception e) {
-        busy = false;
-        dispatchImageError(5, String.valueOf(e.getMessage()));
-      }
+      batchActive = false;
+      sendImageItemLocked(p, np, fSeed, res, fGuidance, fBase64);
     }
+  }
+
+  void callGenerateImageBatch(YailList prompts, String nPrompt, double seedD,
+      String resolution, double guidanceD, boolean base64) {
+    ArrayList<String> list = new ArrayList<String>();
+    try {
+      if (prompts != null) {
+        Object[] arr = prompts.toArray();
+        for (int i = 0; i < arr.length; i++) {
+          Object o = arr[i];
+          list.add(o == null ? "" : o.toString());
+        }
+      }
+    } catch (Exception e) {
+      dispatchImageError(5, "daftar prompt tidak terbaca");
+      return;
+    }
+    String np = nPrompt == null ? "" : nPrompt;
+    String res = mapResolution(resolution);
+    int seed = (int) Math.floor(seedD);
+    if (seedD != seedD || seed < 0) {
+      seed = -1;
+    }
+    int guidance = (int) Math.floor(guidanceD);
+    if (guidanceD != guidanceD) {
+      guidance = 7;
+    }
+    if (guidance < 1) {
+      guidance = 1;
+    }
+    if (guidance > 30) {
+      guidance = 30;
+    }
+    final int fSeed = seed;
+    final int fGuidance = guidance;
+    final boolean fBase64 = base64;
+    synchronized (lock) {
+      if (!ready || webView == null) {
+        dispatchImageError(2, "belum siap");
+        return;
+      }
+      if (busy) {
+        dispatchImageError(3, "sibuk");
+        return;
+      }
+      if (list.isEmpty()) {
+        dispatchImageError(5, "daftar prompt kosong");
+        return;
+      }
+      if (list.size() > IMAGE_BATCH_CAP) {
+        dispatchImageError(5, "kebanyakan (maks " + IMAGE_BATCH_CAP + ")");
+        return;
+      }
+      for (int i = 0; i < list.size(); i++) {
+        if (list.get(i).trim().length() == 0) {
+          dispatchImageError(5, "prompt kosong (no " + (i + 1) + ")");
+          return;
+        }
+      }
+      if (res == null) {
+        dispatchImageError(5, "resolusi salah");
+        return;
+      }
+      batchActive = true;
+      batchPrompts.clear();
+      for (int i = 0; i < list.size(); i++) {
+        batchPrompts.add(list.get(i));
+      }
+      batchIndex = 0;
+      batchOk = 0;
+      batchFail = 0;
+      batchNPrompt = np;
+      batchSeed = fSeed;
+      batchResolution = res;
+      batchGuidance = fGuidance;
+      batchBase64 = fBase64;
+      sendImageItemLocked(batchPrompts.get(0), np, fSeed, res, fGuidance, fBase64);
+    }
+  }
+
+  /** Siapkan + kirim 1 request gambar. Panggil dengan lock dipegang. */
+  private void sendImageItemLocked(String prompt, String np, int seed, String res,
+      int guidance, boolean base64) {
+    busy = true;
+    activeKind = "image";
+    activeId = newId();
+    chunkMode = false;
+    pendingPrompt = prompt;
+    pendingImage = "";
+    imgParts = null;
+    imgReceived = 0;
+    imgMime = "";
+    armTimeout(genTag, IMAGE_TIMEOUT_MS + 5000, true);
+    try {
+      JSONObject o = new JSONObject();
+      o.put("kind", "image");
+      o.put("id", activeId);
+      o.put("prompt", prompt);
+      o.put("n_prompt", np);
+      o.put("seed", seed);
+      o.put("resolution", res);
+      o.put("guidance", guidance);
+      o.put("base64", base64);
+      o.put("systemPrompt", systemPrompt);
+      eval(o.toString());
+    } catch (Exception e) {
+      busy = false;
+      activeKind = "";
+      activeId = "";
+      if (batchActive) {
+        batchActive = false;
+      }
+      dispatchImageError(5, String.valueOf(e.getMessage()));
+    }
+  }
+
+  /**
+   * Maju ke prompt berikut. Panggil dengan lock dipegang + batchActive true.
+   * true = item berikut sudah disiapkan (timeout di-arm ulang, pemanggil
+   * tinggal eval di luar lock); false = batch habis (state direset).
+   */
+  private boolean advanceBatchLocked() {
+    batchIndex++;
+    if (batchIndex >= batchPrompts.size()) {
+      batchActive = false;
+      busy = false;
+      activeKind = "";
+      activeId = "";
+      return false;
+    }
+    activeId = newId();
+    pendingPrompt = batchPrompts.get(batchIndex);
+    pendingImage = "";
+    imgParts = null;
+    imgReceived = 0;
+    imgMime = "";
+    armTimeout(genTag, IMAGE_TIMEOUT_MS + 5000, true);
+    return true;
+  }
+
+  /** Kirim request item batch yang sudah disiapkan (baca state apa adanya). */
+  private void evalBatchItem() {
+    final String id;
+    final String prompt;
+    final String np;
+    final int seed;
+    final String res;
+    final int guidance;
+    final boolean base64;
+    final String sys;
+    synchronized (lock) {
+      id = activeId;
+      prompt = pendingPrompt;
+      np = batchNPrompt;
+      seed = batchSeed;
+      res = batchResolution;
+      guidance = batchGuidance;
+      base64 = batchBase64;
+      sys = systemPrompt;
+    }
+    try {
+      JSONObject o = new JSONObject();
+      o.put("kind", "image");
+      o.put("id", id);
+      o.put("prompt", prompt);
+      o.put("n_prompt", np);
+      o.put("seed", seed);
+      o.put("resolution", res);
+      o.put("guidance", guidance);
+      o.put("base64", base64);
+      o.put("systemPrompt", sys);
+      eval(o.toString());
+    } catch (Exception e) {
+      abortBatch(5, String.valueOf(e.getMessage()));
+    }
+  }
+
+  /** Hentikan batch paksa (dipakai bila pengiriman item berikut gagal total). */
+  private void abortBatch(int code, String msg) {
+    final int total;
+    final int ok;
+    final int fail;
+    synchronized (lock) {
+      if (!batchActive) {
+        return;
+      }
+      batchActive = false;
+      busy = false;
+      activeKind = "";
+      activeId = "";
+      total = batchPrompts.size();
+      ok = batchOk;
+      fail = batchFail;
+    }
+    cancelTimeout();
+    dispatchImageError(code, msg);
+    dispatchBatchDone(total, ok, fail);
+  }
+
+  private void dispatchBatchDone(final int total, final int ok, final int fail) {
+    dispatch(new Runnable() {
+      public void run() {
+        if (image != null) {
+          image.WhenAIGenerateImageBatchDone(total, ok, fail);
+        }
+      }
+    });
   }
 
   void callCancelImage() {
@@ -650,16 +851,39 @@ public class ChatbotEngine {
     final long t = tag;
     timeoutTask = new Runnable() {
       public void run() {
-        boolean fire = false;
+        boolean fireSingle = false;
+        boolean batchCont = false;
+        boolean batchStop = false;
+        int bTotal = 0;
+        int bOk = 0;
+        int bFail = 0;
         synchronized (lock) {
           if (busy && genTag == t) {
-            busy = false;
-            activeKind = "";
-            activeId = "";
-            fire = true;
+            if (isImage && batchActive) {
+              batchFail++;
+              if (advanceBatchLocked()) {
+                batchCont = true;
+              } else {
+                batchStop = true;
+                bTotal = batchPrompts.size();
+                bOk = batchOk;
+                bFail = batchFail;
+              }
+            } else {
+              busy = false;
+              activeKind = "";
+              activeId = "";
+              fireSingle = true;
+            }
           }
         }
-        if (fire) {
+        if (batchCont) {
+          dispatchImageError(1, "timeout");
+          evalBatchItem();
+        } else if (batchStop) {
+          dispatchImageError(1, "timeout");
+          dispatchBatchDone(bTotal, bOk, bFail);
+        } else if (fireSingle) {
           if (isImage) {
             dispatchImageError(1, "timeout");
           } else {
@@ -836,16 +1060,46 @@ public class ChatbotEngine {
     public void onError(String id, int code, String message) {
       final String msg = message == null ? "" : message;
       String kind;
+      boolean batchCont = false;
+      boolean batchStop = false;
+      int bTotal = 0;
+      int bOk = 0;
+      int bFail = 0;
       synchronized (lock) {
         if (!busy || !id.equals(activeId)) {
           return;
         }
         kind = activeKind;
-        busy = false;
-        activeKind = "";
-        activeId = "";
+        if ("image".equals(kind) && batchActive) {
+          if (code == 4) {
+            batchActive = false;
+            busy = false;
+            activeKind = "";
+            activeId = "";
+            batchStop = true;
+            bTotal = batchPrompts.size();
+            bOk = batchOk;
+            bFail = batchFail;
+          } else {
+            batchFail++;
+            if (advanceBatchLocked()) {
+              batchCont = true;
+            } else {
+              batchStop = true;
+              bTotal = batchPrompts.size();
+              bOk = batchOk;
+              bFail = batchFail;
+            }
+          }
+        } else {
+          busy = false;
+          activeKind = "";
+          activeId = "";
+        }
       }
-      cancelTimeout();
+      if (!batchCont) {
+        cancelTimeout();
+      }
       final int c = code;
       if ("image".equals(kind)) {
         dispatch(new Runnable() {
@@ -855,6 +1109,11 @@ public class ChatbotEngine {
             }
           }
         });
+        if (batchCont) {
+          evalBatchItem();
+        } else if (batchStop) {
+          dispatchBatchDone(bTotal, bOk, bFail);
+        }
       } else {
         dispatch(new Runnable() {
           public void run() {
@@ -870,15 +1129,34 @@ public class ChatbotEngine {
     public void onImageDone(String id, String b64, String mime) {
       final String b = b64 == null ? "" : b64;
       final String m = mime == null ? "" : mime;
+      boolean batchCont = false;
+      boolean batchStop = false;
+      int bTotal = 0;
+      int bOk = 0;
+      int bFail = 0;
       synchronized (lock) {
         if (!busy || !id.equals(activeId) || !"image".equals(activeKind)) {
           return;
         }
-        busy = false;
-        activeKind = "";
-        activeId = "";
+        if (batchActive) {
+          batchOk++;
+          if (advanceBatchLocked()) {
+            batchCont = true;
+          } else {
+            batchStop = true;
+            bTotal = batchPrompts.size();
+            bOk = batchOk;
+            bFail = batchFail;
+          }
+        } else {
+          busy = false;
+          activeKind = "";
+          activeId = "";
+        }
       }
-      cancelTimeout();
+      if (!batchCont) {
+        cancelTimeout();
+      }
       dispatch(new Runnable() {
         public void run() {
           if (image != null) {
@@ -886,6 +1164,11 @@ public class ChatbotEngine {
           }
         }
       });
+      if (batchCont) {
+        evalBatchItem();
+      } else if (batchStop) {
+        dispatchBatchDone(bTotal, bOk, bFail);
+      }
     }
 
     @JavascriptInterface
@@ -893,6 +1176,11 @@ public class ChatbotEngine {
       final String c = chunk == null ? "" : chunk;
       boolean done = false;
       String full = null;
+      boolean batchCont = false;
+      boolean batchStop = false;
+      int bTotal = 0;
+      int bOk = 0;
+      int bFail = 0;
       synchronized (lock) {
         if (!busy || !id.equals(activeId) || !"image".equals(activeKind)) {
           return;
@@ -916,14 +1204,28 @@ public class ChatbotEngine {
           full = sb.toString();
           imgParts = null;
           imgReceived = 0;
-          busy = false;
-          activeKind = "";
-          activeId = "";
+          if (batchActive) {
+            batchOk++;
+            if (advanceBatchLocked()) {
+              batchCont = true;
+            } else {
+              batchStop = true;
+              bTotal = batchPrompts.size();
+              bOk = batchOk;
+              bFail = batchFail;
+            }
+          } else {
+            busy = false;
+            activeKind = "";
+            activeId = "";
+          }
           done = true;
         }
       }
       if (done) {
-        cancelTimeout();
+        if (!batchCont) {
+          cancelTimeout();
+        }
         final String f = full;
         dispatch(new Runnable() {
           public void run() {
@@ -932,21 +1234,45 @@ public class ChatbotEngine {
             }
           }
         });
+        if (batchCont) {
+          evalBatchItem();
+        } else if (batchStop) {
+          dispatchBatchDone(bTotal, bOk, bFail);
+        }
       }
     }
 
     @JavascriptInterface
     public void onImageUrl(String id, String url) {
       final String u = url == null ? "" : url;
+      boolean batchCont = false;
+      boolean batchStop = false;
+      int bTotal = 0;
+      int bOk = 0;
+      int bFail = 0;
       synchronized (lock) {
         if (!busy || !id.equals(activeId) || !"image".equals(activeKind)) {
           return;
         }
-        busy = false;
-        activeKind = "";
-        activeId = "";
+        if (batchActive) {
+          batchOk++;
+          if (advanceBatchLocked()) {
+            batchCont = true;
+          } else {
+            batchStop = true;
+            bTotal = batchPrompts.size();
+            bOk = batchOk;
+            bFail = batchFail;
+          }
+        } else {
+          busy = false;
+          activeKind = "";
+          activeId = "";
+        }
       }
-      cancelTimeout();
+      if (!batchCont) {
+        cancelTimeout();
+      }
       dispatch(new Runnable() {
         public void run() {
           if (image != null) {
@@ -954,6 +1280,11 @@ public class ChatbotEngine {
           }
         }
       });
+      if (batchCont) {
+        evalBatchItem();
+      } else if (batchStop) {
+        dispatchBatchDone(bTotal, bOk, bFail);
+      }
     }
   }
 
