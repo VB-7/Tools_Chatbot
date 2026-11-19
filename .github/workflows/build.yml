@@ -29,7 +29,17 @@ jobs:
         run: cp -r ours/src/* template/src/
 
       - name: Build .aix
-        run: cd template && ant extensions
+        run: |
+          cd template
+          set -o pipefail
+          ant extensions 2>&1 | tee ../build.log
+
+      - name: Upload log bila gagal
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
 
       - name: Upload artefak .aix
         uses: actions/upload-artifact@v4
