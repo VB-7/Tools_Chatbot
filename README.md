@@ -7,8 +7,10 @@ Dua komponen non-visible, backend = halaman Perchance `extension-mit-plugin`
   `CallGenerateTeks(prompt, chunk)` / `CallGenerateTeksWithImage(prompt, isUri, image)`
   → `WhenAIGenerateTeks(ischunk, respon, isfinished)`. History kanonis
   `[{role,text,image}]`, auto di halaman (persist localStorage), cap 20 giliran.
-- **AiImage**: stateless. `CallGenerateImage(prompt, n_prompt, seed, resolution,
-  guidance, base64)` → `WhenAIGenerateImage(isfinished, base64, url)`.
+- **AiImage**: MANDIRI (tanpa AiTeks). `CallCreateChatbot()` → `WhenChatbotCreate(...)` →
+  `CallGenerateImage(prompt, n_prompt, seed, resolution[dropdown], guidance, base64)`
+  → `WhenAIGenerateImage(isfinished, base64, url)` (mesin/WebView dibagi dengan AiTeks,
+  cukup Create sekali dari salah satu).
   `true` = base64 RAM-only (1 truk + fallback chunk), `false` = upload → url.
 
 Single-flight global (sibuk → error 3). Error: 1=timeout, 2=belum siap,
