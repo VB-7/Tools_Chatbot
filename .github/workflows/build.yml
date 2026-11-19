@@ -28,6 +28,12 @@ jobs:
       - name: Salin sumber ke template
         run: cp -r ours/src/* template/src/
 
+      - name: Precompile enum Options (agar terbaca annotation processor)
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/prebuilt"
+          javac -source 7 -target 7 -encoding utf-8 -cp "$GITHUB_WORKSPACE/template/lib/appinventor/*:$GITHUB_WORKSPACE/template/lib/deps/*" -d "$GITHUB_WORKSPACE/prebuilt" "$GITHUB_WORKSPACE/ours/src/com/norvex/chatbot/Resolution.java"
+          cd "$GITHUB_WORKSPACE/prebuilt" && jar cf "$GITHUB_WORKSPACE/template/lib/deps/norvex-options.jar" com/norvex/chatbot/Resolution*.class
+
       - name: Build .aix
         run: |
           cd template
