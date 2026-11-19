@@ -12,6 +12,8 @@ Dua komponen non-visible, backend = halaman Perchance `extension-mit-plugin`
   → `WhenAIGenerateImage(isfinished, base64, url)` (mesin/WebView dibagi dengan AiTeks,
   cukup Create sekali dari salah satu).
   `true` = base64 RAM-only (1 truk + fallback chunk), `false` = upload → url.
+  Batch: `CallGenerateImageBatch(prompts[list teks, maks 20], ...param sama...)` →
+  `WhenAIGenerateImage` per gambar sesuai urutan → `WhenAIGenerateImageBatchDone(total, success, failed)`.
 
 Single-flight global (sibuk → error 3). Error: 1=timeout, 2=belum siap,
 4=dibatalkan, 5=salah halaman, 6=upload gagal.
