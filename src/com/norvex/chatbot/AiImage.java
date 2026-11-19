@@ -9,10 +9,11 @@ import com.google.appinventor.components.annotations.UsesPermissions;
 import com.google.appinventor.components.common.ComponentCategory;
 import com.google.appinventor.components.runtime.AndroidNonvisibleComponent;
 import com.google.appinventor.components.runtime.ComponentContainer;
+import com.google.appinventor.components.runtime.util.YailList;
 
 @DesignerComponent(
-    version = 2,
-    versionName = "1.1",
+    version = 3,
+    versionName = "1.2",
     description = "AI image (stateless, tanpa history/cache/storage lokal). "
         + "Panggil CallCreateChatbot dulu (milik komponen ini sendiri, mesin sama dengan AiTeks) "
         + "lalu tunggu WhenChatbotCreate ready=true. Bisa dipakai TANPA AiTeks. "
@@ -69,12 +70,28 @@ public class AiImage extends AndroidNonvisibleComponent {
   public void WhenAIGenerateImageError(int code, String message) {
   }
 
+  @SimpleEvent(description = "Batch selesai (semua / sebagian / dibatalkan): total = jumlah "
+      + "prompt, success = gambar jadi, failed = gagal/timeout. Tiap gambar sudah "
+      + "ditembak satu per satu via WhenAIGenerateImage sesuai urutan.")
+  public void WhenAIGenerateImageBatchDone(int total, int success, int failed) {
+  }
+
   @SimpleFunction(description = "CALL: prompt + n_prompt (negative, kosong=tidak ada) + seed "
       + "(-1/<0 = acak) + resolution [dropdown: Square/Portrait/Landscape/SquareHd] "
       + "+ guidance (1-30, default 7) + base64 flag.")
   public void CallGenerateImage(String prompt, String nPrompt, double seed,
       @Options(Resolution.class) String resolution, double guidance, boolean base64) {
     engine.callGenerateImage(prompt, nPrompt, seed, resolution, guidance, base64);
+  }
+
+  @SimpleFunction(description = "CALL batch: generate BANYAK gambar sekaligus dari daftar prompt "
+      + "(list teks, maks 20, tanpa yang kosong). n_prompt/seed/resolution/guidance/base64 "
+      + "berlaku sama untuk semua. Dijalankan satu per satu (tetap single-flight: "
+      + "sibuk -> error 3). Tiap gambar jadi menembak WhenAIGenerateImage sesuai urutan; "
+      + "selesai semua menembak WhenAIGenerateImageBatchDone. Batalkan via CallCancelImage.")
+  public void CallGenerateImageBatch(YailList prompts, String nPrompt, double seed,
+      @Options(Resolution.class) String resolution, double guidance, boolean base64) {
+    engine.callGenerateImageBatch(prompts, nPrompt, seed, resolution, guidance, base64);
   }
 
   @SimpleFunction(description = "CALL: batalkan generate image yang berjalan. Sukses -> error 4.")
