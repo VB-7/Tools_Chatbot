@@ -107,15 +107,22 @@ public class ChatbotEngine {
   void attachTeks(AiTeks t) { synchronized (lock) { teks = t; } }
   void attachImage(AiImage im) { synchronized (lock) { image = im; } }
 
+  void emitCreate(boolean success, boolean rdy, int code, String msg) {
+    if (teks != null) {
+      teks.WhenChatbotCreate(success, rdy, code, msg);
+    }
+    if (image != null) {
+      image.WhenChatbotCreate(success, rdy, code, msg);
+    }
+  }
+
   void callCreate() {
     synchronized (lock) {
       if (webView != null) {
         final boolean r = ready;
         dispatch(new Runnable() {
           public void run() {
-            if (teks != null) {
-              teks.WhenChatbotCreate(true, r, 0, r ? "sudah siap" : "sudah dibuat, menunggu backend");
-            }
+            emitCreate(true, r, 0, r ? "sudah siap" : "sudah dibuat, menunggu backend");
           }
         });
         return;
@@ -142,9 +149,7 @@ public class ChatbotEngine {
               if (fire) {
                 dispatch(new Runnable() {
                   public void run() {
-                    if (teks != null) {
-                      teks.WhenChatbotCreate(true, false, 0, "halaman termuat, menunggu sinyal backend");
-                    }
+                    emitCreate(true, false, 0, "halaman termuat, menunggu sinyal backend");
                   }
                 });
                 armReadyTimeout();
@@ -159,9 +164,7 @@ public class ChatbotEngine {
               cancelReadyTimeout();
               dispatch(new Runnable() {
                 public void run() {
-                  if (teks != null) {
-                    teks.WhenChatbotCreate(false, false, 5, "gagal muat halaman");
-                  }
+                  emitCreate(false, false, 5, "gagal muat halaman");
                 }
               });
             }
@@ -177,9 +180,7 @@ public class ChatbotEngine {
           }
           dispatch(new Runnable() {
             public void run() {
-              if (teks != null) {
-                teks.WhenChatbotCreate(false, false, 5, String.valueOf(e.getMessage()));
-              }
+              emitCreate(false, false, 5, String.valueOf(e.getMessage()));
             }
           });
         }
@@ -694,9 +695,7 @@ public class ChatbotEngine {
         if (fire) {
           dispatch(new Runnable() {
             public void run() {
-              if (teks != null) {
-                teks.WhenChatbotCreate(true, false, 2, "backend diam (timeout)");
-              }
+              emitCreate(true, false, 2, "backend diam (timeout)");
             }
           });
         }
@@ -764,9 +763,7 @@ public class ChatbotEngine {
       }
       dispatch(new Runnable() {
         public void run() {
-          if (teks != null) {
-            teks.WhenChatbotCreate(true, true, 0, "siap");
-          }
+          emitCreate(true, true, 0, "siap");
         }
       });
     }
