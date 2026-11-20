@@ -3,14 +3,24 @@ package com.norvex.chatbot;
 import android.content.Context;
 import android.os.Handler;
 import android.os.Looper;
+import android.view.ViewGroup;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 
+import com.google.appinventor.components.runtime.AndroidViewComponent;
 import com.google.appinventor.components.runtime.ComponentContainer;
 import com.google.appinventor.components.runtime.Form;
 import com.google.appinventor.components.runtime.util.YailDictionary;
 import com.google.appinventor.components.runtime.util.YailList;
+
+import android.net.Uri;
+import android.util.Base64;
+
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.InputStream;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -30,7 +40,9 @@ import java.util.List;
  */
 public class ChatbotEngine {
 
-  static final String BACKEND_URL = "https://null.perchance.org/extension-mit-plugin";
+  // PENTING: jangan pakai null.perchance.org — origin "null" bikin
+  // plugin AI (coupled server) tidak bisa dipakai. Pakai subdomain asli.
+  static final String BACKEND_URL = "https://04fa0030a954ffb6dc080d0afc56ecea.perchance.org/extension-mit-plugin";
   static final String HIST_ID = "__hist__";
 
   static final int TEXT_TIMEOUT_MS = 120000;
@@ -58,6 +70,10 @@ public class ChatbotEngine {
   private final Object lock = new Object();
   private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
+  /** UI chat HTML (pemula). Dibaca/ditulis di UI thread; chatBusy volatile. */
+  private ChatUiWeb chatUi = null;
+  private volatile boolean chatBusy = false;
+
   private AiTeks teks = null;
   private AiImage image = null;
 
@@ -68,6 +84,8 @@ public class ChatbotEngine {
   private String activeKind = "";
   private String activeId = "";
   private long genTag = 0;
+  private int genSeq = 0;
+  private int activeSeq = 0;
 
   private String pendingPrompt = "";
   private String pendingImage = "";
@@ -93,6 +111,7 @@ public class ChatbotEngine {
   private String batchResolution = "512x512";
   private int batchGuidance = 7;
   private boolean batchBase64 = true;
+  private final ArrayList<Integer> batchFailedIdx = new ArrayList<Integer>();
 
   private static final class Turn {
     final String role;
@@ -126,6 +145,13 @@ public class ChatbotEngine {
     }
     if (image != null) {
       image.WhenChatbotCreate(success, rdy, code, msg);
+    }
+    if (chatUi != null) {
+      try {
+        chatUi.pushState(success && rdy);
+      } catch (Exception e) {
+        // abaikan
+      }
     }
   }
 
@@ -208,6 +234,7 @@ public class ChatbotEngine {
       busy = false;
       activeKind = "";
       activeId = "";
+      chatBusy = false;
       ready = false;
       pageOk = false;
       mirror.clear();
@@ -234,11 +261,192 @@ public class ChatbotEngine {
             wv.removeJavascriptInterface("Android");
             wv.destroy();
           }
+          if (chatUi != null) {
+            try {
+              chatUi.detach();
+            } catch (Exception e) {
+              // abaikan
+            }
+            chatUi = null;
+          }
         } catch (Exception e) {
           // abaikan
         }
       }
     });
+  }
+
+  // ---------------- UI chat HTML (pemula: teks + gambar) ----------------
+
+  /**
+   * Pasang UI chat jadi di Arrangement + pulihkan backup (boleh kosong).
+   * Selalu pastikan backend Create (idempoten). Aman dipanggil ulang.
+   */
+  void setupChatUi(final AndroidViewComponent container, final YailList backup) {
+    restoreMirror(backup);
+    callCreate();
+    form.runOnUiThread(new Runnable() {
+      public void run() {
+        try {
+          ViewGroup vg = ChatUiWeb.groupOf(container);
+          if (chatUi != null) {
+            try {
+              chatUi.detach();
+            } catch (Exception e) {
+              // abaikan
+            }
+            chatUi = null;
+          }
+          if (vg == null) {
+            dispatchTeksError("", 5, "wadah chat tidak valid (pakai VerticalArrangement kosong)");
+            return;
+          }
+          ChatUiWeb ui = new ChatUiWeb(form, context, ChatbotEngine.this);
+          ui.build(vg);
+          chatUi = ui;
+          // history + status dikirim saat halaman UI selesai dimuat (onChatUiLoaded)
+        } catch (Exception e) {
+          dispatchTeksError("", 5, String.valueOf(e.getMessage()));
+        }
+      }
+    });
+  }
+
+  /** Dipanggil UI-WebView saat halamannya siap (boleh berkali-kali, idempoten). */
+  void onChatUiLoaded() {
+    final ChatUiWeb ui = chatUi;
+    if (ui == null) {
+      return;
+    }
+    final YailList hist = getAllHistory();
+    final boolean st;
+    synchronized (lock) {
+      st = ready && webView != null;
+    }
+    dispatch(new Runnable() {
+      public void run() {
+        try {
+          ui.pushHistory(hist);
+          ui.pushState(st);
+        } catch (Exception e) {
+          // abaikan
+        }
+        emitChatUi(true, 0, "siap");
+      }
+    });
+  }
+
+  /** Kirim dari UI chat: teks (streaming). */
+  void chatSendTeks(String prompt) {
+    chatBusy = true;
+    callGenerateTeks(prompt == null ? "" : prompt, true);
+  }
+
+  /** Kirim dari UI chat: vision (dataURL dari JS, sudah downscale). */
+  void chatSendVision(String dataUrl, String prompt) {
+    chatBusy = true;
+    callGenerateTeksWithImage(prompt == null ? "" : prompt, false,
+        dataUrl == null ? "" : dataUrl);
+  }
+
+  /** Kirim dari UI chat: gambar single (selalu url-mode). */
+  void chatSendImage(String p, String n, double s, String r, double g) {
+    chatBusy = true;
+    callGenerateImage(p == null ? "" : p, n == null ? "" : n,
+        s, r == null || r.length() == 0 ? "512x512" : r, g, false);
+  }
+
+  /** Wrapper publik untuk validasi bridge (tanpa id internal). */
+  void dispatchTeksErrorPublic(int code, String msg) {
+    dispatchTeksError("", code, msg);
+  }
+
+  /** Pulihkan mirror dari backup list-of-dict (validasi longgar, maks 40). */
+  private void restoreMirror(YailList backup) {
+    if (backup == null) {
+      return;
+    }
+    try {
+      Object[] arr = backup == null ? new Object[0] : backup.toArray();
+      ArrayList<Turn> tmp = new ArrayList<Turn>();
+      for (int i = 0; i < arr.length && tmp.size() < 40; i++) {
+        Object o = arr[i];
+        if (!(o instanceof YailDictionary)) {
+          continue;
+        }
+        YailDictionary d = (YailDictionary) o;
+        String role = strOf(d.get("role"));
+        String text = strOf(d.get("text"));
+        String image = strOf(d.get("image"));
+        if (!("user".equals(role) || "ai".equals(role))) {
+          continue;
+        }
+        if (text.length() == 0 && image.length() == 0) {
+          continue;
+        }
+        if (image.length() > 4000) {
+          image = "";
+        }
+        tmp.add(new Turn(role, text, image));
+      }
+      synchronized (lock) {
+        mirror.clear();
+        mirror.addAll(tmp);
+      }
+    } catch (Exception e) {
+      // abaikan, pakai mirror apa adanya
+    }
+  }
+
+  private static String strOf(Object o) {
+    if (o == null) {
+      return "";
+    }
+    try {
+      return String.valueOf(o);
+    } catch (Exception e) {
+      return "";
+    }
+  }
+
+  /** Dorong seluruh history ke UI chat (mis. setelah H-blok). */
+  private void pushHistoryAll() {
+    final ChatUiWeb ui = chatUi;
+    if (ui == null) {
+      return;
+    }
+    final YailList hist = getAllHistory();
+    dispatch(new Runnable() {
+      public void run() {
+        try {
+          ui.pushHistory(hist);
+        } catch (Exception e) {
+          // abaikan
+        }
+      }
+    });
+  }
+
+  /** Event backup ke MIT: snapshot history terbaru (TinyDB-ready). */
+  private void emitChatUi(final boolean success, final int code, final String msg) {
+    final YailList hist = getAllHistory();
+    dispatch(new Runnable() {
+      public void run() {
+        try {
+          if (teks != null) {
+            teks.WhenChatUI(success, hist, code, msg);
+          }
+        } catch (Exception e) {
+          // abaikan
+        }
+      }
+    });
+  }
+
+  /** Sinkron ulang UI chat + event backup (setelah H-blok). */
+  private void refreshChatUi() {
+    pushHistoryAll();
+    emitChatUi(true, 0, "ok");
   }
 
   boolean isReady() {
@@ -250,6 +458,12 @@ public class ChatbotEngine {
   boolean isGenerating() {
     synchronized (lock) {
       return busy;
+    }
+  }
+
+  int currentResponseId() {
+    synchronized (lock) {
+      return activeSeq;
     }
   }
 
@@ -302,7 +516,144 @@ public class ChatbotEngine {
       }
       startGen("textWithImage", p, im, isUri, false);
     }
-    sendGenerate();
+    if (!needsLocalImageRead(im)) {
+      sendGenerate();
+      return;
+    }
+    // Path / file:// / content:// tidak bisa dibaca halaman (WebView) —
+    // extension baca di sini lalu kirim sebagai base64 (halaman jadikan Blob).
+    final String myId;
+    final String fIm = im;
+    synchronized (lock) {
+      myId = activeId;
+    }
+    new Thread(new Runnable() {
+      public void run() {
+        byte[] data = readLocalImageBytes(fIm);
+        String b64 = null;
+        if (data != null) {
+          try {
+            b64 = Base64.encodeToString(data, Base64.NO_WRAP);
+          } catch (Exception e) {
+            b64 = null;
+          }
+        }
+        boolean drop = false;
+        boolean unreadable = false;
+        synchronized (lock) {
+          if (!busy || !myId.equals(activeId)
+              || !"textWithImage".equals(activeKind)) {
+            drop = true;
+          } else if (b64 == null) {
+            busy = false;
+            activeKind = "";
+            activeId = "";
+            unreadable = true;
+          } else {
+            pendingImage = b64;
+            pendingIsUri = false;
+          }
+        }
+        if (drop) {
+          return;
+        }
+        if (unreadable) {
+          cancelTimeout();
+          dispatchTeksError("", 5, "gambar tidak terbaca");
+          return;
+        }
+        sendGenerate();
+      }
+    }).start();
+  }
+
+  /** True bila gambar harus dibaca extension (path / file:// / content:// /
+   *  nama file), bukan diteruskan mentah (http(s) / data: / base64). */
+  private boolean needsLocalImageRead(String im) {
+    if (im.regionMatches(true, 0, "http", 0, 4)) {
+      return false;
+    }
+    if (im.regionMatches(true, 0, "data:", 0, 5)) {
+      return false;
+    }
+    if (im.regionMatches(true, 0, "content://", 0, 10)
+        || im.regionMatches(true, 0, "file://", 0, 7)
+        || (im.length() > 0 && im.charAt(0) == '/')) {
+      return true;
+    }
+    // Sisa: base64 mentah (teruskan) atau nama file relatif (coba baca).
+    return !looksInlineBase64(im);
+  }
+
+  private boolean looksInlineBase64(String s) {
+    String t = s.trim();
+    if (t.length() < 100) {
+      return false;
+    }
+    for (int i = 0; i < t.length(); i++) {
+      char c = t.charAt(i);
+      boolean ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+          || (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '='
+          || c == '\r' || c == '\n';
+      if (!ok) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /** Baca byte gambar lokal (maks 20 MB). null bila tidak terbaca. */
+  private byte[] readLocalImageBytes(String im) {
+    InputStream in = null;
+    try {
+      if (im.regionMatches(true, 0, "content://", 0, 10)) {
+        in = context.getContentResolver().openInputStream(Uri.parse(im));
+      } else {
+        String p = im;
+        if (p.regionMatches(true, 0, "file://", 0, 7)) {
+          p = p.substring(7);
+        }
+        File f = new File(p);
+        if (!f.isAbsolute() || !f.exists()) {
+          return null;
+        }
+        in = new FileInputStream(f);
+      }
+      if (in == null) {
+        return null;
+      }
+      ByteArrayOutputStream bos = new ByteArrayOutputStream();
+      byte[] buf = new byte[8192];
+      int n;
+      long total = 0;
+      while ((n = in.read(buf)) >= 0) {
+        total += n;
+        if (total > 20 * 1024 * 1024) {
+          try {
+            in.close();
+          } catch (Exception e) {
+            // abaikan
+          }
+          return null;
+        }
+        bos.write(buf, 0, n);
+      }
+      try {
+        in.close();
+      } catch (Exception e) {
+        // abaikan
+      }
+      return bos.toByteArray();
+    } catch (Exception e) {
+      try {
+        if (in != null) {
+          in.close();
+        }
+      } catch (Exception ex) {
+        // abaikan
+      }
+      return null;
+    }
   }
 
   void callCancelTeks() {
@@ -422,6 +773,7 @@ public class ChatbotEngine {
       batchIndex = 0;
       batchOk = 0;
       batchFail = 0;
+      batchFailedIdx.clear();
       batchNPrompt = np;
       batchSeed = fSeed;
       batchResolution = res;
@@ -533,6 +885,7 @@ public class ChatbotEngine {
     final int total;
     final int ok;
     final int fail;
+    final YailList fIdx;
     synchronized (lock) {
       if (!batchActive) {
         return;
@@ -544,20 +897,65 @@ public class ChatbotEngine {
       total = batchPrompts.size();
       ok = batchOk;
       fail = batchFail;
+      fIdx = batchFailedIdxList();
     }
     cancelTimeout();
     dispatchImageError(code, msg);
-    dispatchBatchDone(total, ok, fail);
+    dispatchBatchDone(total, ok, fail, fIdx);
   }
 
-  private void dispatchBatchDone(final int total, final int ok, final int fail) {
+  private void dispatchBatchDone(final int total, final int ok, final int fail,
+      final YailList failedIdx) {
     dispatch(new Runnable() {
       public void run() {
         if (image != null) {
-          image.WhenAIGenerateImageBatchDone(total, ok, fail);
+          image.WhenAIGenerateImageBatchDone(total, ok, fail, failedIdx);
         }
       }
     });
+  }
+
+  private void dispatchBatchItem(final int index, final int total,
+      final String b64, final String url) {
+    dispatch(new Runnable() {
+      public void run() {
+        if (image != null) {
+          image.WhenAIGenerateImageBatchItem(index, total, b64, url);
+        }
+      }
+    });
+  }
+
+  private YailList batchFailedIdxList() {
+    ArrayList<Integer> out = new ArrayList<Integer>();
+    for (int i = 0; i < batchFailedIdx.size(); i++) {
+      out.add(batchFailedIdx.get(i));
+    }
+    return YailList.makeList(out);
+  }
+
+  int getPairCount() {
+    synchronized (lock) {
+      return mirror.size() / 2;
+    }
+  }
+
+  YailList getBatchProgress() {
+    int done;
+    int total;
+    synchronized (lock) {
+      if (batchActive) {
+        done = batchOk + batchFail;
+        total = batchPrompts.size();
+      } else {
+        done = 0;
+        total = 0;
+      }
+    }
+    ArrayList<Integer> out = new ArrayList<Integer>();
+    out.add(Integer.valueOf(done));
+    out.add(Integer.valueOf(total));
+    return YailList.makeList(out);
   }
 
   void callCancelImage() {
@@ -620,6 +1018,7 @@ public class ChatbotEngine {
     if (send) {
       sendPairOp("removePair", giliran, null, 0);
     }
+    refreshChatUi();
   }
 
   void replaceUser(int giliran, String text) {
@@ -635,6 +1034,7 @@ public class ChatbotEngine {
     if (send) {
       sendPairOp("replaceUser", giliran, t, 0);
     }
+    refreshChatUi();
   }
 
   void replaceAi(int giliran, String text) {
@@ -650,6 +1050,7 @@ public class ChatbotEngine {
     if (send) {
       sendPairOp("replaceAi", giliran, t, 0);
     }
+    refreshChatUi();
   }
 
   void clearHistory() {
@@ -666,6 +1067,7 @@ public class ChatbotEngine {
     if (send) {
       sendKindOnly("clearHistory");
     }
+    refreshChatUi();
   }
 
   // ---------------- internal ----------------
@@ -679,6 +1081,8 @@ public class ChatbotEngine {
     busy = true;
     activeKind = kind;
     activeId = newId();
+    genSeq++;
+    activeSeq = genSeq;
     pendingPrompt = prompt;
     pendingImage = image;
     pendingIsUri = isUri;
@@ -783,12 +1187,31 @@ public class ChatbotEngine {
 
   private void callCancel() {
     final String id;
+    final String kind;
+    final boolean wasBatch;
+    final int bTotal;
+    final int bOk;
+    final int bFail;
+    final YailList bFailed;
     synchronized (lock) {
       if (!busy) {
         return;
       }
       id = activeId;
+      kind = activeKind;
+      wasBatch = batchActive && "image".equals(kind);
+      bTotal = batchPrompts.size();
+      bOk = batchOk;
+      bFail = batchFail;
+      bFailed = batchFailedIdxList();
+      busy = false;
+      activeKind = "";
+      activeId = "";
+      batchActive = false;
     }
+    cancelTimeout();
+    // Beritahu halaman agar kerja AI berhenti; balasan halaman (id lama)
+    // otomatis diabaikan karena id sudah tidak cocok.
     try {
       JSONObject o = new JSONObject();
       o.put("kind", "cancel");
@@ -796,7 +1219,15 @@ public class ChatbotEngine {
       o.put("targetId", id);
       eval(o.toString());
     } catch (Exception e) {
-      // halaman yang putuskan; timeout Java jadi pengaman
+      // abaikan: lokal sudah berhenti
+    }
+    if ("image".equals(kind)) {
+      dispatchImageError(4, "dibatalkan");
+      if (wasBatch) {
+        dispatchBatchDone(bTotal, bOk, bFail, bFailed);
+      }
+    } else {
+      dispatchTeksError("", 4, "dibatalkan");
     }
   }
 
@@ -832,6 +1263,17 @@ public class ChatbotEngine {
         if (teks != null) {
           teks.WhenAIGenerateTeksError(code, msg);
         }
+        if (chatBusy) {
+          chatBusy = false;
+          if (chatUi != null) {
+            try {
+              chatUi.pushError(code, msg);
+            } catch (Exception e) {
+              // abaikan
+            }
+          }
+        }
+        emitChatUi(false, code, msg);
       }
     });
   }
@@ -841,6 +1283,14 @@ public class ChatbotEngine {
       public void run() {
         if (image != null) {
           image.WhenAIGenerateImageError(code, msg);
+        }
+        if (chatBusy && chatUi != null) {
+          chatBusy = false;
+          try {
+            chatUi.pushImgError(code, msg);
+          } catch (Exception e) {
+            // abaikan
+          }
         }
       }
     });
@@ -857,10 +1307,12 @@ public class ChatbotEngine {
         int bTotal = 0;
         int bOk = 0;
         int bFail = 0;
+        YailList bFailed = null;
         synchronized (lock) {
           if (busy && genTag == t) {
             if (isImage && batchActive) {
               batchFail++;
+              batchFailedIdx.add(Integer.valueOf(batchIndex + 1));
               if (advanceBatchLocked()) {
                 batchCont = true;
               } else {
@@ -868,6 +1320,7 @@ public class ChatbotEngine {
                 bTotal = batchPrompts.size();
                 bOk = batchOk;
                 bFail = batchFail;
+                bFailed = batchFailedIdxList();
               }
             } else {
               busy = false;
@@ -882,7 +1335,7 @@ public class ChatbotEngine {
           evalBatchItem();
         } else if (batchStop) {
           dispatchImageError(1, "timeout");
-          dispatchBatchDone(bTotal, bOk, bFail);
+          dispatchBatchDone(bTotal, bOk, bFail, bFailed);
         } else if (fireSingle) {
           if (isImage) {
             dispatchImageError(1, "timeout");
@@ -996,18 +1449,28 @@ public class ChatbotEngine {
     public void onTextChunk(String id, int seq, int total, String chunk) {
       final String c = chunk == null ? "" : chunk;
       boolean fire = false;
+      int respId = 0;
       synchronized (lock) {
         if (busy && id.equals(activeId)
             && ("text".equals(activeKind) || "textWithImage".equals(activeKind))) {
           textAccum.append(c);
           fire = chunkMode;
+          respId = activeSeq;
         }
       }
       if (fire) {
+        final int fId = respId;
         dispatch(new Runnable() {
           public void run() {
             if (teks != null) {
-              teks.WhenAIGenerateTeks(true, c, false);
+              teks.WhenAIGenerateTeks(true, c, false, fId);
+            }
+            if (chatBusy && chatUi != null) {
+              try {
+                chatUi.pushChunk(c);
+              } catch (Exception e) {
+                // abaikan
+              }
             }
           }
         });
@@ -1025,6 +1488,7 @@ public class ChatbotEngine {
       String prompt;
       String img;
       boolean wasChunk;
+      int respId;
       synchronized (lock) {
         if (!busy || !id.equals(activeId)) {
           return;
@@ -1033,6 +1497,7 @@ public class ChatbotEngine {
         prompt = pendingPrompt;
         img = pendingImage;
         wasChunk = chunkMode;
+        respId = activeSeq;
         busy = false;
         activeKind = "";
         activeId = "";
@@ -1047,11 +1512,23 @@ public class ChatbotEngine {
         appendForced(t);
       }
       final String full = t;
+      final int fId = respId;
       dispatch(new Runnable() {
         public void run() {
           if (teks != null) {
-            teks.WhenAIGenerateTeks(false, full, true);
+            teks.WhenAIGenerateTeks(false, full, true, fId);
           }
+          if (chatBusy) {
+            chatBusy = false;
+            if (chatUi != null) {
+              try {
+                chatUi.pushDone(full);
+              } catch (Exception e) {
+                // abaikan
+              }
+            }
+          }
+          emitChatUi(true, 0, "ok");
         }
       });
     }
@@ -1065,6 +1542,7 @@ public class ChatbotEngine {
       int bTotal = 0;
       int bOk = 0;
       int bFail = 0;
+      YailList bFailed = null;
       synchronized (lock) {
         if (!busy || !id.equals(activeId)) {
           return;
@@ -1080,8 +1558,10 @@ public class ChatbotEngine {
             bTotal = batchPrompts.size();
             bOk = batchOk;
             bFail = batchFail;
+            bFailed = batchFailedIdxList();
           } else {
             batchFail++;
+            batchFailedIdx.add(Integer.valueOf(batchIndex + 1));
             if (advanceBatchLocked()) {
               batchCont = true;
             } else {
@@ -1089,6 +1569,7 @@ public class ChatbotEngine {
               bTotal = batchPrompts.size();
               bOk = batchOk;
               bFail = batchFail;
+              bFailed = batchFailedIdxList();
             }
           }
         } else {
@@ -1112,16 +1593,10 @@ public class ChatbotEngine {
         if (batchCont) {
           evalBatchItem();
         } else if (batchStop) {
-          dispatchBatchDone(bTotal, bOk, bFail);
+          dispatchBatchDone(bTotal, bOk, bFail, bFailed);
         }
       } else {
-        dispatch(new Runnable() {
-          public void run() {
-            if (teks != null) {
-              teks.WhenAIGenerateTeksError(c, msg);
-            }
-          }
-        });
+        dispatchTeksError("", c, msg);
       }
     }
 
@@ -1129,16 +1604,24 @@ public class ChatbotEngine {
     public void onImageDone(String id, String b64, String mime) {
       final String b = b64 == null ? "" : b64;
       final String m = mime == null ? "" : mime;
+      String chatP = "";
       boolean batchCont = false;
       boolean batchStop = false;
+      boolean wasBatchItem = false;
+      int itemNo = 0;
+      int itemTotal = 0;
       int bTotal = 0;
       int bOk = 0;
       int bFail = 0;
+      YailList bFailed = null;
       synchronized (lock) {
         if (!busy || !id.equals(activeId) || !"image".equals(activeKind)) {
           return;
         }
         if (batchActive) {
+          wasBatchItem = true;
+          itemNo = batchIndex + 1;
+          itemTotal = batchPrompts.size();
           batchOk++;
           if (advanceBatchLocked()) {
             batchCont = true;
@@ -1147,27 +1630,43 @@ public class ChatbotEngine {
             bTotal = batchPrompts.size();
             bOk = batchOk;
             bFail = batchFail;
+            bFailed = batchFailedIdxList();
           }
         } else {
           busy = false;
           activeKind = "";
           activeId = "";
+          chatP = pendingPrompt == null ? "" : pendingPrompt;
         }
       }
       if (!batchCont) {
         cancelTimeout();
       }
-      dispatch(new Runnable() {
-        public void run() {
-          if (image != null) {
-            image.WhenAIGenerateImage(true, b, "");
+      if (wasBatchItem) {
+        dispatchBatchItem(itemNo, itemTotal, b, "");
+      } else {
+        final String fb = b;
+        final String fp = chatP;
+        dispatch(new Runnable() {
+          public void run() {
+            if (image != null) {
+              image.WhenAIGenerateImage(true, fb, "");
+            }
+            if (chatBusy && chatUi != null) {
+              chatBusy = false;
+              try {
+                chatUi.pushImgDone(fb, fp);
+              } catch (Exception e) {
+                // abaikan
+              }
+            }
           }
-        }
-      });
+        });
+      }
       if (batchCont) {
         evalBatchItem();
       } else if (batchStop) {
-        dispatchBatchDone(bTotal, bOk, bFail);
+        dispatchBatchDone(bTotal, bOk, bFail, bFailed);
       }
     }
 
@@ -1176,11 +1675,16 @@ public class ChatbotEngine {
       final String c = chunk == null ? "" : chunk;
       boolean done = false;
       String full = null;
+      String chatP = "";
       boolean batchCont = false;
       boolean batchStop = false;
+      boolean wasBatchItem = false;
+      int itemNo = 0;
+      int itemTotal = 0;
       int bTotal = 0;
       int bOk = 0;
       int bFail = 0;
+      YailList bFailed = null;
       synchronized (lock) {
         if (!busy || !id.equals(activeId) || !"image".equals(activeKind)) {
           return;
@@ -1205,6 +1709,9 @@ public class ChatbotEngine {
           imgParts = null;
           imgReceived = 0;
           if (batchActive) {
+            wasBatchItem = true;
+            itemNo = batchIndex + 1;
+            itemTotal = batchPrompts.size();
             batchOk++;
             if (advanceBatchLocked()) {
               batchCont = true;
@@ -1213,11 +1720,13 @@ public class ChatbotEngine {
               bTotal = batchPrompts.size();
               bOk = batchOk;
               bFail = batchFail;
+              bFailed = batchFailedIdxList();
             }
           } else {
             busy = false;
             activeKind = "";
             activeId = "";
+            chatP = pendingPrompt == null ? "" : pendingPrompt;
           }
           done = true;
         }
@@ -1226,18 +1735,31 @@ public class ChatbotEngine {
         if (!batchCont) {
           cancelTimeout();
         }
-        final String f = full;
-        dispatch(new Runnable() {
-          public void run() {
-            if (image != null) {
-              image.WhenAIGenerateImage(true, f, "");
+        if (wasBatchItem) {
+          dispatchBatchItem(itemNo, itemTotal, full, "");
+        } else {
+          final String f = full;
+          final String fp = chatP;
+          dispatch(new Runnable() {
+            public void run() {
+              if (image != null) {
+                image.WhenAIGenerateImage(true, f, "");
+              }
+              if (chatBusy && chatUi != null) {
+                chatBusy = false;
+                try {
+                  chatUi.pushImgDone(f, fp);
+                } catch (Exception e) {
+                  // abaikan
+                }
+              }
             }
-          }
-        });
+          });
+        }
         if (batchCont) {
           evalBatchItem();
         } else if (batchStop) {
-          dispatchBatchDone(bTotal, bOk, bFail);
+          dispatchBatchDone(bTotal, bOk, bFail, bFailed);
         }
       }
     }
@@ -1245,16 +1767,24 @@ public class ChatbotEngine {
     @JavascriptInterface
     public void onImageUrl(String id, String url) {
       final String u = url == null ? "" : url;
+      String chatP = "";
       boolean batchCont = false;
       boolean batchStop = false;
+      boolean wasBatchItem = false;
+      int itemNo = 0;
+      int itemTotal = 0;
       int bTotal = 0;
       int bOk = 0;
       int bFail = 0;
+      YailList bFailed = null;
       synchronized (lock) {
         if (!busy || !id.equals(activeId) || !"image".equals(activeKind)) {
           return;
         }
         if (batchActive) {
+          wasBatchItem = true;
+          itemNo = batchIndex + 1;
+          itemTotal = batchPrompts.size();
           batchOk++;
           if (advanceBatchLocked()) {
             batchCont = true;
@@ -1263,27 +1793,43 @@ public class ChatbotEngine {
             bTotal = batchPrompts.size();
             bOk = batchOk;
             bFail = batchFail;
+            bFailed = batchFailedIdxList();
           }
         } else {
           busy = false;
           activeKind = "";
           activeId = "";
+          chatP = pendingPrompt == null ? "" : pendingPrompt;
         }
       }
       if (!batchCont) {
         cancelTimeout();
       }
-      dispatch(new Runnable() {
-        public void run() {
-          if (image != null) {
-            image.WhenAIGenerateImage(true, "", u);
+      if (wasBatchItem) {
+        dispatchBatchItem(itemNo, itemTotal, "", u);
+      } else {
+        final String fu = u;
+        final String fp = chatP;
+        dispatch(new Runnable() {
+          public void run() {
+            if (image != null) {
+              image.WhenAIGenerateImage(true, "", fu);
+            }
+            if (chatBusy && chatUi != null) {
+              chatBusy = false;
+              try {
+                chatUi.pushImgDone(fu, fp);
+              } catch (Exception e) {
+                // abaikan
+              }
+            }
           }
-        }
-      });
+        });
+      }
       if (batchCont) {
         evalBatchItem();
       } else if (batchStop) {
-        dispatchBatchDone(bTotal, bOk, bFail);
+        dispatchBatchDone(bTotal, bOk, bFail, bFailed);
       }
     }
   }
